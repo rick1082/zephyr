@@ -14,7 +14,8 @@
 #include <bluetooth/conn.h>
 #include <bluetooth/audio/audio.h>
 #include <sys/byteorder.h>
-
+#include <logging/log.h>
+LOG_MODULE_REGISTER(main);
 
 #define DEVICE_NAME_PEER_L "BT_HEADSET_L"
 #define DEVICE_NAME_PEER_L_LEN (sizeof(DEVICE_NAME_PEER_L) - 1)
@@ -29,7 +30,6 @@ enum {
 	HEADSET_R = 1,
 };
 
-static struct bt_conn *default_conn;
 static struct bt_conn *headset_conn[2];
 static struct k_work_delayable audio_send_work;
 static struct bt_audio_stream audio_stream[2];
@@ -45,178 +45,6 @@ NET_BUF_POOL_FIXED_DEFINE(tx_pool, 1, CONFIG_BT_ISO_TX_MTU + BT_ISO_CHAN_SEND_RE
 static struct bt_audio_lc3_preset codec_configuration = BT_AUDIO_LC3_UNICAST_PRESET_16_2_1;
 
 static int discover_sink(struct bt_conn *conn);
-static int configure_stream(struct bt_conn * conn);
-static int create_group(struct bt_audio_stream *stream);
-static int set_stream_qos(struct bt_conn * conn);
-static K_SEM_DEFINE(sem_stream_qos, 0, 1);
-static K_SEM_DEFINE(sem_stream_enabled, 0, 1);
-static K_SEM_DEFINE(sem_stream_started, 0, 1);
-
-#if defined(CONFIG_LIBLC3CODEC)
-
-#include "lc3.h"
-#include "math.h"
-
-#define MAX_SAMPLE_RATE 48000
-#define MAX_FRAME_DURATION_US 10000
-#define MAX_NUM_SAMPLES ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
-#define AUDIO_VOLUME (INT16_MAX - 3000) /* codec does clipping above INT16_MAX - 3000 */
-#define AUDIO_TONE_FREQUENCY_HZ 400
-
-static int16_t audio_buf[MAX_NUM_SAMPLES];
-static lc3_encoder_t lc3_encoder;
-static lc3_encoder_mem_48k_t lc3_encoder_mem;
-static int freq_hz;
-static int frame_duration_us;
-static int frame_duration_100us;
-static int frames_per_sdu;
-static int octets_per_frame;
-
-/**
- * Use the math lib to generate a sine-wave using 16 bit samples into a buffer.
- *
- * @param buf Destination buffer
- * @param length_us Length of the buffer in microseconds
- * @param frequency_hz frequency in Hz
- * @param sample_rate_hz sample-rate in Hz.
- */
-static void fill_audio_buf_sin(int16_t *buf, int length_us, int frequency_hz, int sample_rate_hz)
-{
-	const int sine_period_samples = sample_rate_hz / frequency_hz;
-	const unsigned int num_samples = (length_us * sample_rate_hz) / USEC_PER_SEC;
-	const float step = 2 * 3.1415 / sine_period_samples;
-
-	for (unsigned int i = 0; i < num_samples; i++) {
-		const float sample = sin(i * step);
-
-		buf[i] = (int16_t)(AUDIO_VOLUME * sample);
-	}
-}
-
-static void lc3_audio_timer_timeout(struct k_work *work)
-{
-	/* For the first call-back we push multiple audio frames to the buffer to use the
-	 * controller ISO buffer to handle jitter.
-	 */
-	const uint8_t prime_count = 2;
-	static int64_t start_time;
-	static int32_t sdu_cnt;
-	int32_t sdu_goal_cnt;
-	int64_t uptime, run_time_ms, run_time_100us;
-
-	k_work_schedule(&audio_send_work, K_USEC(codec_configuration.qos.interval));
-
-	if (lc3_encoder == NULL) {
-		printk("LC3 encoder not setup, cannot encode data.\n");
-		return;
-	}
-
-	if (start_time == 0) {
-		/* Read start time and produce the number of frames needed to catch up with any
-		 * inaccuracies in the timer. by calculating the number of frames we should
-		 * have sent and compare to how many were actually sent.
-		 */
-		start_time = k_uptime_get();
-	}
-
-	uptime = k_uptime_get();
-	run_time_ms = uptime - start_time;
-
-	/* PDU count calculations done in 100us units to allow 7.5ms framelength in fixed-point */
-	run_time_100us = run_time_ms * 10;
-	sdu_goal_cnt = run_time_100us / (frame_duration_100us * frames_per_sdu);
-
-	/* Add primer value to ensure the controller do not run low on data due to jitter */
-	sdu_goal_cnt += prime_count;
-
-	printk("LC3 encode %d frames in %d SDUs\n", (sdu_goal_cnt - sdu_cnt) * frames_per_sdu,
-	       (sdu_goal_cnt - sdu_cnt));
-
-	while (sdu_cnt < sdu_goal_cnt) {
-		int ret;
-		struct net_buf *buf;
-		uint8_t *net_buffer;
-		uint16_t lc3_ret;
-		const uint16_t tx_sdu_len = frames_per_sdu * octets_per_frame;
-		int offset = 0;
-
-		buf = net_buf_alloc(&tx_pool, K_FOREVER);
-		net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
-
-		net_buffer = net_buf_tail(buf);
-		buf->len += tx_sdu_len;
-
-		for (int i = 0; i < frames_per_sdu; i++) {
-			lc3_ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, audio_buf, 1,
-					     octets_per_frame, net_buffer + offset);
-			offset += octets_per_frame;
-		}
-
-		if (lc3_ret == -1) {
-			printk("LC3 encoder failed - wrong parameters?: %d", lc3_ret);
-			net_buf_unref(buf);
-			return;
-		}
-
-		ret = bt_audio_stream_send(&audio_stream, buf);
-
-		if (ret < 0) {
-			printk("  Failed to send LC3 audio data (%d)\n", ret);
-			net_buf_unref(buf);
-		} else {
-			printk("  TX LC3 l: %zu\n", tx_sdu_len);
-			sdu_cnt++;
-		}
-	}
-}
-
-static void init_lc3(void)
-{
-	unsigned int num_samples;
-
-	freq_hz = bt_codec_cfg_get_freq(&codec_configuration.codec);
-	frame_duration_us = bt_codec_cfg_get_frame_duration_us(&codec_configuration.codec);
-	octets_per_frame = bt_codec_cfg_get_octets_per_frame(&codec_configuration.codec);
-	frames_per_sdu = bt_codec_cfg_get_frame_blocks_per_sdu(audio_stream.codec, true);
-	octets_per_frame = bt_codec_cfg_get_octets_per_frame(audio_stream.codec);
-
-	if (freq_hz < 0) {
-		printk("Error: Codec frequency not set, cannot start codec.");
-		return;
-	}
-
-	if (frame_duration_us < 0) {
-		printk("Error: Frame duration not set, cannot start codec.");
-		return;
-	}
-
-	if (octets_per_frame < 0) {
-		printk("Error: Octets per frame not set, cannot start codec.");
-		return;
-	}
-
-	frame_duration_100us = frame_duration_us / 100;
-
-	/* Fill audio buffer with Sine wave only once and repeat encoding the same tone frame */
-	fill_audio_buf_sin(audio_buf, frame_duration_us, AUDIO_TONE_FREQUENCY_HZ, freq_hz);
-
-	num_samples = ((frame_duration_us * freq_hz) / USEC_PER_SEC);
-	for (unsigned int i = 0; i < num_samples; i++) {
-		printk("%3i: %6i\n", i, audio_buf[i]);
-	}
-
-	/* Create the encoder instance. This shall complete before stream_started() is called. */
-	lc3_encoder = lc3_setup_encoder(frame_duration_us, freq_hz, 0, /* No resampling */
-					&lc3_encoder_mem);
-
-	if (lc3_encoder == NULL) {
-		printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
-	}
-}
-
-#else
-
-#define init_lc3(...)
 
 /**
  * @brief Send audio data on timeout
@@ -256,10 +84,10 @@ static void audio_timer_timeout(struct k_work *work)
 
 	ret = bt_audio_stream_send(&audio_stream, buf);
 	if (ret < 0) {
-		printk("Failed to send audio data (%d)\n", ret);
+		LOG_ERR("Failed to send audio data (%d)", ret);
 		net_buf_unref(buf);
 	} else {
-		printk("Sending mock data with len %zu\n", len_to_send);
+		LOG_INF("Sending mock data with len %zu", len_to_send);
 	}
 
 	k_work_schedule(&audio_send_work, K_MSEC(1000));
@@ -269,8 +97,6 @@ static void audio_timer_timeout(struct k_work *work)
 		len_to_send = 1;
 	}
 }
-
-#endif
 
 static void print_hex(const uint8_t *ptr, size_t len)
 {
@@ -305,18 +131,21 @@ bool all_headset_connected(void)
 {
 	for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
 		if (headset_conn[i] == NULL) {
-			printk("device %d not connected", i);
+			LOG_ERR("device %d not connected", i);
 			return false;
 		}
 	}
-	printk("all devices connected\n");
+	LOG_INF("all devices connected\n");
 	return true;
 }
+
+#define BT_LE_CONN_PARAM_TWS BT_LE_CONN_PARAM(100, \
+						  100, \
+						  0, 400)
 
 static bool check_audio_support_and_connect(struct bt_data *data, void *user_data)
 {
 	bt_addr_le_t *addr = user_data;
-	int i;
 	int ret;
 	//printk("[AD]: %u data_len %u\n", data->type, data->data_len);
 	struct bt_conn *conn;
@@ -327,9 +156,9 @@ static bool check_audio_support_and_connect(struct bt_data *data, void *user_dat
 			bt_le_scan_stop();
 
 			ret = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-						BT_LE_CONN_PARAM_DEFAULT, &conn);
+						BT_LE_CONN_PARAM_TWS, &conn);
 			if (ret) {
-				printk("Could not init connection");
+				LOG_ERR("Could not init connection");
 				return ret;
 			}
 			headset_conn[HEADSET_L] = conn;
@@ -339,15 +168,16 @@ static bool check_audio_support_and_connect(struct bt_data *data, void *user_dat
 			bt_le_scan_stop();
 
 			ret = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-						BT_LE_CONN_PARAM_DEFAULT, &conn);
+						BT_LE_CONN_PARAM_TWS, &conn);
 			if (ret) {
-				printk("Could not init connection");
+				LOG_ERR("Could not init connection");
 				return ret;
 			}
 			headset_conn[HEADSET_R] = conn;
 			return 0; //stop parsing
 		}
 	}
+
 	return true;
 }
 
@@ -356,16 +186,16 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 {
 	char addr_str[BT_ADDR_LE_STR_LEN];
 
-	/* We're only interested in connectable events
+	/* We're only interested in connectable events 	*/
 	if (type != BT_GAP_ADV_TYPE_ADV_IND && type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
 		return;
 	}
- */
+
 	(void)bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
 	//printk("Device found: %s (RSSI %d)\n", addr_str, rssi);
 
 	/* connect only to devices in close proximity */
-	if (rssi < -70) {
+	if (rssi < -90) {
 		return;
 	}
 
@@ -377,57 +207,72 @@ static void start_scan(void)
 	int err;
 
 	/* This demo doesn't require active scan */
-	err = bt_le_scan_start(BT_LE_SCAN_ACTIVE, device_found);
+	err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, device_found);
 	if (err != 0) {
-		printk("Scanning failed to start (err %d)\n", err);
+		LOG_ERR("Scanning failed to start (err %d)", err);
 		return;
 	}
 
-	printk("Scanning successfully started\n");
+	LOG_INF("Scanning successfully started");
 }
 
 static void stream_configured(struct bt_audio_stream *stream, const struct bt_codec_qos_pref *pref)
 {
-	printk("Audio Stream %p configured, conn %p\n", stream, stream->conn);
-	k_sleep(K_MSEC(500));
-	//k_sem_give(&sem_stream_configured);
-	set_stream_qos(stream->conn);
+	int err;
+	LOG_INF("Audio Stream %p configured, conn %p", (void *)stream, (void *)stream->conn);
+	err = bt_audio_stream_qos(stream->conn, unicast_group, &codec_configuration.qos);
+	if (err != 0) {
+		LOG_ERR("Unable to setup QoS for conn %p: %d", (void *)stream->conn, err);
+	}else {
+		LOG_INF("qos set");
+	}
 }
 
 static void stream_qos_set(struct bt_audio_stream *stream)
 {
-	printk("Audio Stream %p QoS set\n", stream);
-	//k_sem_give(&sem_stream_qos);
+	int err;
+
+	LOG_INF("Audio Stream %p QoS set", (void *)stream);
+	err = bt_audio_stream_enable(stream, codec_configuration.codec.meta,
+				     codec_configuration.codec.meta_count);
+	if (err != 0) {
+		LOG_ERR("Unable to enable stream: %d", err);
+	} else {
+		LOG_INF("enable stream");
+	}
 }
 
 static void stream_enabled(struct bt_audio_stream *stream)
 {
-	printk("Audio Stream %p enabled\n", stream);
+	int err;
 
-	k_sem_give(&sem_stream_enabled);
+	LOG_INF("Audio Stream %p enabled", (void *)stream);
+	err = bt_audio_stream_start(stream);
+	if (err != 0) {
+		LOG_ERR("Unable to start stream: %d", err);
+	}
 }
 
 static void stream_started(struct bt_audio_stream *stream)
 {
-	printk("Audio Stream %p started\n", stream);
-
+	LOG_INF("Audio Stream %p started", stream);
 	/* Start send timer */
-	k_work_schedule(&audio_send_work, K_MSEC(0));
+	//k_work_schedule(&audio_send_work, K_MSEC(0));
 }
 
 static void stream_metadata_updated(struct bt_audio_stream *stream)
 {
-	printk("Audio Stream %p metadata updated\n", stream);
+	LOG_INF("Audio Stream %p metadata updated", (void *)stream);
 }
 
 static void stream_disabled(struct bt_audio_stream *stream)
 {
-	printk("Audio Stream %p disabled\n", stream);
+	LOG_INF("Audio Stream %p disabled", (void *)stream);
 }
 
 static void stream_stopped(struct bt_audio_stream *stream)
 {
-	printk("Audio Stream %p stopped\n", stream);
+	LOG_INF("Audio Stream %p stopped", (void *)stream);
 
 	/* Stop send timer */
 	k_work_cancel_delayable(&audio_send_work);
@@ -435,7 +280,7 @@ static void stream_stopped(struct bt_audio_stream *stream)
 
 static void stream_released(struct bt_audio_stream *stream)
 {
-	printk("Audio Stream %p released\n", stream);
+	LOG_INF("Audio Stream %p released", (void *)stream);
 }
 
 static struct bt_audio_stream_ops stream_ops = {
@@ -451,16 +296,15 @@ static struct bt_audio_stream_ops stream_ops = {
 
 static void add_remote_sink(struct bt_audio_ep *ep, uint8_t index)
 {
-	printk("Sink #%u: ep %p\n", index, ep);
-
+	LOG_INF("Sink #%u: ep %p", index, (void *)ep);
 	sinks[index] = ep;
 }
 
 static void add_remote_codec(struct bt_codec *codec_capabilities, int index, uint8_t type)
 {
-	printk("#%u: codec %p type 0x%02x\n", index, codec_capabilities, type);
+	//printk("#%u: codec %p type 0x%02x\n", index, codec_capabilities, type);
 
-	print_codec_capabilities(codec_capabilities);
+	//print_codec_capabilities(codec_capabilities);
 
 	if (type != BT_AUDIO_SINK && type != BT_AUDIO_SOURCE) {
 		return;
@@ -474,17 +318,18 @@ static void add_remote_codec(struct bt_codec *codec_capabilities, int index, uin
 static void discover_sink_cb(struct bt_conn *conn, struct bt_codec *codec, struct bt_audio_ep *ep,
 			     struct bt_audio_discover_params *params)
 {
-	int ep_index;
+	int ep_index = 0;
+	int err;
 	if (conn == headset_conn[HEADSET_L]) {
-		printk("discover sink cb for left\n");
+		LOG_INF("discover sink cb for left");
 		ep_index = HEADSET_L;
 	} else if (conn == headset_conn[HEADSET_R]) {
-		printk("discover sink cb for right\n");
+		LOG_INF("discover sink cb for right");
 		ep_index = HEADSET_R;
 	}
 
 	if (params->err != 0) {
-		printk("Discovery failed: %d\n", params->err);
+		LOG_INF("Discovery failed: %d", params->err);
 		return;
 	}
 
@@ -498,17 +343,24 @@ static void discover_sink_cb(struct bt_conn *conn, struct bt_codec *codec, struc
 			//add_remote_sink(ep, params->num_eps);
 			add_remote_sink(ep, ep_index);
 		} else {
-			printk("Invalid param type: %u\n", params->type);
+			printk("Invalid param type: %u", params->type);
 		}
 
 		return;
 	}
 
-	printk("Discover complete: err %d\n", params->err);
+	LOG_INF("Discover complete: err %d", params->err);
 
 	(void)memset(params, 0, sizeof(*params));
-	configure_stream(conn);
-	//k_sem_give(&sem_sink_discovered);
+
+	if (conn == headset_conn[HEADSET_L]) {
+		err = bt_audio_stream_config(conn, &audio_stream[HEADSET_L], sinks[HEADSET_L], &codec_configuration.codec);
+		LOG_INF("configure stream for sink[HEADSET_L], err = %d", err);
+	} else if (conn == headset_conn[HEADSET_R]) {
+		err = bt_audio_stream_config(conn, &audio_stream[HEADSET_R], sinks[HEADSET_R], &codec_configuration.codec);
+		LOG_INF("configure stream for sink[HEADSET_R], err = %d", err);
+	}
+
 }
 
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -518,7 +370,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	(void)bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
 	if (err != 0) {
-		printk("Failed to connect to %s (%u)\n", addr, err);
+		LOG_INF("Failed to connect to %s (%u)", addr, err);
 
 		if (conn == headset_conn[HEADSET_L]) {
 			bt_conn_unref(headset_conn[HEADSET_L]);
@@ -527,6 +379,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 			bt_conn_unref(headset_conn[HEADSET_R]);
 			headset_conn[HEADSET_R] = NULL;
 		}
+		k_sleep(K_MSEC(500));
 		start_scan();
 		return;
 	}
@@ -536,10 +389,11 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	}
 	err = bt_conn_set_security(conn, BT_SECURITY_L2);
 	if (err != 0) {
-		printk("SMP failed, err = %d", err);
+		LOG_ERR("SMP failed, err = %d", err);
 	}
-	printk("Connected: %s\n", addr);
+	LOG_INF("Connected: %s", addr);
 	if (!all_headset_connected()) {
+		k_sleep(K_MSEC(500));
 		start_scan();
 	} else {
 		bt_le_scan_stop();
@@ -549,14 +403,13 @@ static void connected(struct bt_conn *conn, uint8_t err)
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
-	printk("%s", __func__);
 	if (conn != headset_conn[HEADSET_L] && conn != headset_conn[HEADSET_R]) {
 		return;
 	}
 
 	(void)bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-	printk("Disconnected: %s (reason 0x%02x)\n", addr, reason);
+	LOG_INF("Disconnected: %s (reason 0x%02x)", addr, reason);
 
 	if (conn == headset_conn[HEADSET_L]) {
 		bt_conn_unref(headset_conn[HEADSET_L]);
@@ -567,29 +420,6 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	}
 
 	start_scan();
-}
-static struct bt_gatt_exchange_params exchange_params;
-static void mtu_exchange_handler(struct bt_conn *conn, uint8_t err,
-				 struct bt_gatt_exchange_params *params)
-{
-	int ret;
-	if (err) {
-		printk("MTU exchange failed, err = %d", err);
-		ret = bt_conn_disconnect(conn, BT_HCI_ERR_LOCALHOST_TERM_CONN);
-		if (ret) {
-			printk("Failed to disconnected, %d", ret);
-		}
-	} else {
-		printk("MTU exchange success");
-		//discover_sink(conn);
-	}
-}
-
-int gateway_mtu_exchange(struct bt_conn *conn)
-{
-	exchange_params.func = mtu_exchange_handler;
-	printk("gateway mtu exchange");
-	return bt_gatt_exchange_mtu(conn, &exchange_params);
 }
 
 static bool conn_param_req_cb(struct bt_conn *conn, struct bt_le_conn_param *param)
@@ -614,15 +444,13 @@ static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum 
 	int ret;
 
 	if (err) {
-		printk("Security failed: level %u err %d", level, err);
+		LOG_ERR("Security failed: level %u err %d", level, err);
 		ret = bt_conn_disconnect(conn, err);
 		if (ret) {
-			printk("Failed to disconnect %d", ret);
+			LOG_ERR("Failed to disconnect %d", ret);
 		}
 	} else {
-		printk("Security changed: level %u\n", level);
-		//ret = gateway_mtu_exchange(conn);
-		//printk("bt_gatt_exchange_mtu() err =%d\n", ret);
+		LOG_INF("Security changed: level %u\n", level);
 		discover_sink(conn);
 	}
 }
@@ -644,36 +472,29 @@ static int init(void)
 
 	err = bt_enable(NULL);
 	if (err != 0) {
-		printk("Bluetooth enable failed (err %d)\n", err);
+		LOG_ERR("Bluetooth enable failed (err %d)", err);
 		return err;
 	}
 
 	audio_stream[0].ops = &stream_ops;
 	audio_stream[1].ops = &stream_ops;
-	create_group(audio_stream);
+	err = bt_audio_unicast_group_create(audio_stream, 2, &unicast_group);
+	if (err != 0) {
+		LOG_ERR("bt_audio_unicast_group_create failed, err = %d", err);
+	}else {
+		LOG_INF("bt_audio_unicast_group_create finished");
+	}
 
-#if defined(CONFIG_LIBLC3CODEC)
-	k_work_init_delayable(&audio_send_work, lc3_audio_timer_timeout);
-#else
 	k_work_init_delayable(&audio_send_work, audio_timer_timeout);
-#endif
 
-	return 0;
-}
-
-static int scan_and_connect(void)
-{
-	int err;
-
-	start_scan();
 	return 0;
 }
 
 static int discover_sink(struct bt_conn *conn)
 {
+	int err = 0;
 	static struct bt_audio_discover_params params_l;
 	static struct bt_audio_discover_params params_r;
-	int err;
 
 	params_l.func = discover_sink_cb;
 	params_l.type = BT_AUDIO_SINK;
@@ -686,114 +507,7 @@ static int discover_sink(struct bt_conn *conn)
 		err = bt_audio_discover(conn, &params_r);	
 	}
 	if (err != 0) {
-		printk("Failed to discover sink: %d\n", err);
-		return err;
-	}
-/*
-	err = k_sem_take(&sem_sink_discovered, K_FOREVER);
-	if (err != 0) {
-		printk("failed to take sem_sink_discovered (err %d)\n", err);
-		return err;
-	}
-*/
-	return 0;
-}
-
-static int configure_stream(struct bt_conn * conn)
-{
-	int err;
-	int sink_index;
-	//struct bt_audio_stream *stream;
-	if (conn == headset_conn[HEADSET_L]) {
-		sink_index = HEADSET_L;
-		err = bt_audio_stream_config(conn, &audio_stream[HEADSET_L], sinks[sink_index], &codec_configuration.codec);
-	} else if (conn == headset_conn[HEADSET_R]) {
-		sink_index = HEADSET_R;
-		err = bt_audio_stream_config(conn, &audio_stream[HEADSET_R], sinks[sink_index], &codec_configuration.codec);
-	}
-
-
-	if (err != 0) {
-		printk("Could not configure stream\n");
-		return err;
-	}
-
-	printk("configure stream for sink[%d] finished\n", sink_index);
-	return 0;
-}
-
-static int create_group(struct bt_audio_stream *stream)
-{
-	int err;
-
-	err = bt_audio_unicast_group_create(stream, 2, &unicast_group);
-	if (err != 0) {
-		printk("Could not create unicast group (err %d)\n", err);
-		return err;
-	}else {
-		printk("unicast group created\n");
-	}
-	return 0;
-}
-
-static int set_stream_qos(struct bt_conn * conn)
-{
-	int err;
-
-	err = bt_audio_stream_qos(conn, unicast_group, &codec_configuration.qos);
-	if (err != 0) {
-		printk("Unable to setup QoS: %d", err);
-		return err;
-	}else {
-		printk("qos set");
-	}
-/*
-	err = k_sem_take(&sem_stream_qos, K_FOREVER);
-	if (err != 0) {
-		printk("failed to take sem_stream_qos (err %d)\n", err);
-		return err;
-	}
-*/
-	return 0;
-}
-
-static int enable_stream(struct bt_audio_stream *stream)
-{
-	int err;
-
-	if (IS_ENABLED(CONFIG_LIBLC3CODEC)) {
-		init_lc3();
-	}
-
-	err = bt_audio_stream_enable(stream, codec_configuration.codec.meta,
-				     codec_configuration.codec.meta_count);
-	if (err != 0) {
-		printk("Unable to enable stream: %d", err);
-		return err;
-	}
-
-	err = k_sem_take(&sem_stream_enabled, K_FOREVER);
-	if (err != 0) {
-		printk("failed to take sem_stream_enabled (err %d)\n", err);
-		return err;
-	}
-
-	return 0;
-}
-
-static int start_stream(struct bt_audio_stream *stream)
-{
-	int err;
-
-	err = bt_audio_stream_start(stream);
-	if (err != 0) {
-		printk("Unable to start stream: %d\n", err);
-		return err;
-	}
-
-	err = k_sem_take(&sem_stream_started, K_FOREVER);
-	if (err != 0) {
-		printk("failed to take sem_stream_started (err %d)\n", err);
+		LOG_ERR("Failed to discover sink: %d", err);
 		return err;
 	}
 
@@ -804,62 +518,18 @@ void main(void)
 {
 	int err;
 
-	printk("Initializing\n");
+	LOG_INF("Initializing");
 	err = init();
 	if (err != 0) {
 		return;
 	}
-	printk("Initialized\n");
+	printk("Initialized");
 
-	printk("Waiting for connection\n");
+	printk("Waiting for connection");
 
 	start_scan();
 
 	while (1) {
 		k_sleep(K_MSEC(1000));
 	}
-	/*
-
-	printk("Discovering sink\n");
-	err = discover_sink();
-	if (err != 0) {
-		return;
-	}
-	printk("Sink discovered\n");
-
-	printk("Configuring stream\n");
-	err = configure_stream(&audio_stream);
-	if (err != 0) {
-		return;
-	}
-	printk("Stream configured\n");
-
-	printk("Creating unicast group\n");
-	err = create_group(&audio_stream);
-	if (err != 0) {
-		return;
-	}
-	printk("Unicast group created\n");
-
-	printk("Setting stream QoS\n");
-	err = set_stream_qos();
-	if (err != 0) {
-		return;
-	}
-	printk("Stream QoS Set\n");
-
-	printk("Enabling stream\n");
-	err = enable_stream(&audio_stream);
-	if (err != 0) {
-		return;
-	}
-	printk("Stream enabled\n");
-
-	printk("Starting stream\n");
-	err = start_stream(&audio_stream);
-	if (err != 0) {
-		return;
-	}
-	printk("Stream started\n");
-	*/
 }

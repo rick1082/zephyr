@@ -51,27 +51,24 @@ static uint8_t unicast_server_addata[] = {
 	0x00, /* Metadata length */
 };
 
-/* TODO: Expand with BAP data */
+/* TODO: Expand with BAP data 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_ASCS_VAL)),
-	//BT_DATA(BT_DATA_SVC_DATA16, unicast_server_addata, ARRAY_SIZE(unicast_server_addata)),
-};
-
-#if defined(CONFIG_LIBLC3CODEC)
-
-#include "lc3.h"
-
-#define MAX_SAMPLE_RATE         48000
-#define MAX_FRAME_DURATION_US   10000
-#define MAX_NUM_SAMPLES         ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
-
-static int16_t audio_buf[MAX_NUM_SAMPLES];
-static lc3_decoder_t lc3_decoder;
-static lc3_decoder_mem_48k_t lc3_decoder_mem;
-static int frames_per_sdu;
-
+	BT_DATA(BT_DATA_SVC_DATA16, unicast_server_addata, ARRAY_SIZE(unicast_server_addata)),
+};*/
+#define LEFT_HEADSET
+#ifdef LEFT_HEADSET
+#define DEVICE_NAME_PEER "BT_HEADSET_L"
+#else
+#define DEVICE_NAME_PEER "BT_HEADSET_R"
 #endif
+#define DEVICE_NAME_PEER_LEN (sizeof(DEVICE_NAME_PEER) - 1)
+
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME_PEER, DEVICE_NAME_PEER_LEN),
+};
 
 void print_hex(const uint8_t *ptr, size_t len)
 {
@@ -153,11 +150,6 @@ static struct bt_audio_stream *lc3_config(struct bt_conn *conn,
 
 	printk("No streams available\n");
 
-#if defined(CONFIG_LIBLC3CODEC)
-	/* Nothing to free as static memory is used */
-	lc3_decoder = NULL;
-#endif
-
 	return NULL;
 }
 
@@ -168,11 +160,6 @@ static int lc3_reconfig(struct bt_audio_stream *stream,
 	printk("ASE Codec Reconfig: stream %p cap %p\n", stream, cap);
 
 	print_codec(codec);
-
-#if defined(CONFIG_LIBLC3CODEC)
-	/* Nothing to free as static memory is used */
-	lc3_decoder = NULL;
-#endif
 
 	/* We only support one QoS at the moment, reject changes */
 	return -ENOEXEC;
@@ -192,35 +179,6 @@ static int lc3_enable(struct bt_audio_stream *stream,
 		      size_t meta_count)
 {
 	printk("Enable: stream %p meta_count %u\n", stream, meta_count);
-
-#if defined(CONFIG_LIBLC3CODEC)
-	{
-		const int freq = bt_codec_cfg_get_freq(stream->codec);
-		const int frame_duration_us = bt_codec_cfg_get_frame_duration_us(stream->codec);
-
-		if (freq < 0) {
-			printk("Error: Codec frequency not set, cannot start codec.");
-			return -1;
-		}
-
-		if (frame_duration_us < 0) {
-			printk("Error: Frame duration not set, cannot start codec.");
-			return -1;
-		}
-
-		frames_per_sdu = bt_codec_cfg_get_frame_blocks_per_sdu(stream->codec, true);
-
-		lc3_decoder = lc3_setup_decoder(frame_duration_us,
-						freq,
-						0, /* No resampling */
-						&lc3_decoder_mem);
-
-		if (lc3_decoder == NULL) {
-			printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
-			return -1;
-		}
-	}
-#endif
 
 	return 0;
 }
@@ -274,70 +232,13 @@ static struct bt_audio_capability_ops lc3_ops = {
 };
 
 
-#if defined(CONFIG_LIBLC3CODEC)
-
-static void stream_recv_lc3_codec(struct bt_audio_stream *stream, struct net_buf *buf)
-{
-	uint8_t err = -1;
-
-	/* TODO: If there is a way to know if the controller supports indicating errors in the
-	 *       payload one could feed that into bad-frame-indicator. The HCI layer allows to
-	 *       include this information, but currently there is no controller support.
-	 *       Here it is assumed that reveiving a zero-length payload means a lost frame -
-	 *       but actually it could just as well indicate a pause in the stream.
-	 */
-	const uint8_t bad_frame_indicator = buf->len == 0 ? 1 : 0;
-	uint8_t *in_buf = (bad_frame_indicator ? NULL : buf->data);
-	const int octets_per_frame = buf->len / frames_per_sdu;
-
-	if (lc3_decoder == NULL) {
-		printk("LC3 decoder not setup, cannot decode data.\n");
-		return;
-	}
-
-	/* This code is to demonstrate the use of the LC3 codec. On an actual implementation
-	 * it might be required to offload the processing to another task to avoid blocking the
-	 * BT stack.
-	 */
-	for (int i = 0; i < frames_per_sdu; i++) {
-
-		int offset = 0;
-
-		err = lc3_decode(lc3_decoder, in_buf + offset, octets_per_frame,
-				 LC3_PCM_FORMAT_S16, audio_buf, 1);
-
-		if (in_buf != NULL) {
-			offset += octets_per_frame;
-		}
-	}
-
-	printk("RX stream %p len %u\n", stream, buf->len);
-
-	if (err == 1) {
-		printk("  decoder performed PLC\n");
-		return;
-
-	} else if (err < 0) {
-		printk("  decoder failed - wrong parameters?\n");
-		return;
-	}
-}
-
-#else
-
 static void stream_recv(struct bt_audio_stream *stream, struct net_buf *buf)
 {
 	printk("Incoming audio on stream %p len %u\n", stream, buf->len);
 }
 
-#endif
-
 static struct bt_audio_stream_ops stream_ops = {
-#if defined(CONFIG_LIBLC3CODEC)
-	.recv = stream_recv_lc3_codec
-#else
 	.recv = stream_recv
-#endif
 };
 
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -407,11 +308,10 @@ static struct bt_audio_capability caps[] = {
 		.ops = &lc3_ops,
 	}
 };
-/*
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-};
-*/
+#define BT_LE_ADV_FAST_CONN                                                                        \
+	BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONNECTABLE, BT_GAP_ADV_FAST_INT_MIN_1,                      \
+			BT_GAP_ADV_FAST_INT_MAX_1, NULL)
+
 void main(void)
 {
 	int err;
@@ -432,28 +332,7 @@ void main(void)
 		bt_audio_stream_cb_register(&streams[i], &stream_ops);
 	}
 
-	/* Create a non-connectable non-scannable advertising set
-	struct bt_le_ext_adv *adv;
-
-	err = bt_le_ext_adv_create(BT_LE_EXT_ADV_CONN_NAME, NULL, &adv);
-	if (err) {
-		printk("Failed to create advertising set (err %d)\n", err);
-		return;
-	}
-
-	err = bt_le_ext_adv_set_data(adv, ad, ARRAY_SIZE(ad), NULL, 0);
-	if (err) {
-		printk("Failed to set advertising data (err %d)\n", err);
-		return;
-	}
-
-	err = bt_le_ext_adv_start(adv, BT_LE_EXT_ADV_START_DEFAULT);
-	if (err) {
-		printk("Failed to start advertising set (err %d)\n", err);
-		return;
-	}*/
-
-	err = bt_le_adv_start(BT_LE_ADV_CONN_NAME, ad, ARRAY_SIZE(ad), NULL, 0);
+	err = bt_le_adv_start(BT_LE_ADV_FAST_CONN, ad, ARRAY_SIZE(ad), NULL, 0);
 	if (err) {
 		printk("Advertising failed to start (err %d)\n", err);
 		return;
