@@ -15,17 +15,27 @@
 #include <bluetooth/audio/audio.h>
 #include <sys/byteorder.h>
 
+#define DEVICE_NAME_PEER_L "BT_HEADSET_L"
+#define DEVICE_NAME_PEER_L_LEN (sizeof(DEVICE_NAME_PEER_L) - 1)
+
+#define DEVICE_NAME_PEER_R "BT_HEADSET_R"
+#define DEVICE_NAME_PEER_R_LEN (sizeof(DEVICE_NAME_PEER_R) - 1)
+
 static void start_scan(void);
 
+enum {
+	HEADSET_L = 0,
+	HEADSET_R = 1,
+};
+
 static struct bt_conn *default_conn;
+static struct bt_conn *headset_conn[2];
 static struct k_work_delayable audio_send_work;
 static struct bt_audio_stream audio_stream;
 static struct bt_audio_unicast_group *unicast_group;
 static struct bt_codec *remote_codec_capabilities[CONFIG_BT_AUDIO_UNICAST_CLIENT_PAC_COUNT];
 static struct bt_audio_ep *sinks[CONFIG_BT_AUDIO_UNICAST_CLIENT_ASE_SNK_COUNT];
-NET_BUF_POOL_FIXED_DEFINE(tx_pool, 1,
-			  CONFIG_BT_ISO_TX_MTU + BT_ISO_CHAN_SEND_RESERVE,
-			  8, NULL);
+NET_BUF_POOL_FIXED_DEFINE(tx_pool, 1, CONFIG_BT_ISO_TX_MTU + BT_ISO_CHAN_SEND_RESERVE, 8, NULL);
 
 /* Select a codec configuration to apply that is mandatory to support by both client and server.
  * Allows this sample application to work without logic to parse the codec capabilities of the
@@ -33,24 +43,23 @@ NET_BUF_POOL_FIXED_DEFINE(tx_pool, 1,
  */
 static struct bt_audio_lc3_preset codec_configuration = BT_AUDIO_LC3_UNICAST_PRESET_16_2_1;
 
-static K_SEM_DEFINE(sem_connected, 0, 1);
-static K_SEM_DEFINE(sem_sink_discovered, 0, 1);
+static int discover_sink(struct bt_conn *conn);
+
 static K_SEM_DEFINE(sem_stream_configured, 0, 1);
 static K_SEM_DEFINE(sem_stream_qos, 0, 1);
 static K_SEM_DEFINE(sem_stream_enabled, 0, 1);
 static K_SEM_DEFINE(sem_stream_started, 0, 1);
-
 
 #if defined(CONFIG_LIBLC3CODEC)
 
 #include "lc3.h"
 #include "math.h"
 
-#define MAX_SAMPLE_RATE         48000
-#define MAX_FRAME_DURATION_US   10000
-#define MAX_NUM_SAMPLES         ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
-#define AUDIO_VOLUME            (INT16_MAX - 3000) /* codec does clipping above INT16_MAX - 3000 */
-#define AUDIO_TONE_FREQUENCY_HZ   400
+#define MAX_SAMPLE_RATE 48000
+#define MAX_FRAME_DURATION_US 10000
+#define MAX_NUM_SAMPLES ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
+#define AUDIO_VOLUME (INT16_MAX - 3000) /* codec does clipping above INT16_MAX - 3000 */
+#define AUDIO_TONE_FREQUENCY_HZ 400
 
 static int16_t audio_buf[MAX_NUM_SAMPLES];
 static lc3_encoder_t lc3_encoder;
@@ -60,7 +69,6 @@ static int frame_duration_us;
 static int frame_duration_100us;
 static int frames_per_sdu;
 static int octets_per_frame;
-
 
 /**
  * Use the math lib to generate a sine-wave using 16 bit samples into a buffer.
@@ -120,17 +128,15 @@ static void lc3_audio_timer_timeout(struct k_work *work)
 	sdu_goal_cnt += prime_count;
 
 	printk("LC3 encode %d frames in %d SDUs\n", (sdu_goal_cnt - sdu_cnt) * frames_per_sdu,
-						    (sdu_goal_cnt - sdu_cnt));
+	       (sdu_goal_cnt - sdu_cnt));
 
 	while (sdu_cnt < sdu_goal_cnt) {
-
 		int ret;
 		struct net_buf *buf;
 		uint8_t *net_buffer;
 		uint16_t lc3_ret;
 		const uint16_t tx_sdu_len = frames_per_sdu * octets_per_frame;
 		int offset = 0;
-
 
 		buf = net_buf_alloc(&tx_pool, K_FOREVER);
 		net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
@@ -139,9 +145,8 @@ static void lc3_audio_timer_timeout(struct k_work *work)
 		buf->len += tx_sdu_len;
 
 		for (int i = 0; i < frames_per_sdu; i++) {
-
-			lc3_ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, audio_buf,
-					     1, octets_per_frame, net_buffer + offset);
+			lc3_ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, audio_buf, 1,
+					     octets_per_frame, net_buffer + offset);
 			offset += octets_per_frame;
 		}
 
@@ -190,7 +195,6 @@ static void init_lc3(void)
 
 	frame_duration_100us = frame_duration_us / 100;
 
-
 	/* Fill audio buffer with Sine wave only once and repeat encoding the same tone frame */
 	fill_audio_buf_sin(audio_buf, frame_duration_us, AUDIO_TONE_FREQUENCY_HZ, freq_hz);
 
@@ -200,9 +204,7 @@ static void init_lc3(void)
 	}
 
 	/* Create the encoder instance. This shall complete before stream_started() is called. */
-	lc3_encoder = lc3_setup_encoder(frame_duration_us,
-					freq_hz,
-					0, /* No resampling */
+	lc3_encoder = lc3_setup_encoder(frame_duration_us, freq_hz, 0, /* No resampling */
 					&lc3_encoder_mem);
 
 	if (lc3_encoder == NULL) {
@@ -277,77 +279,73 @@ static void print_hex(const uint8_t *ptr, size_t len)
 
 static void print_codec_capabilities(const struct bt_codec *codec)
 {
-	printk("codec 0x%02x cid 0x%04x vid 0x%04x count %u\n",
-	       codec->id, codec->cid, codec->vid, codec->data_count);
+	printk("codec 0x%02x cid 0x%04x vid 0x%04x count %u\n", codec->id, codec->cid, codec->vid,
+	       codec->data_count);
 
 	for (size_t i = 0; i < codec->data_count; i++) {
-		printk("data #%zu: type 0x%02x len %u\n",
-		       i, codec->data[i].data.type,
+		printk("data #%zu: type 0x%02x len %u\n", i, codec->data[i].data.type,
 		       codec->data[i].data.data_len);
 		print_hex(codec->data[i].data.data,
-			  codec->data[i].data.data_len -
-			  sizeof(codec->data[i].data.type));
+			  codec->data[i].data.data_len - sizeof(codec->data[i].data.type));
 		printk("\n");
 	}
 
 	for (size_t i = 0; i < codec->meta_count; i++) {
-		printk("meta #%zu: type 0x%02x len %u\n",
-		       i, codec->meta[i].data.type,
+		printk("meta #%zu: type 0x%02x len %u\n", i, codec->meta[i].data.type,
 		       codec->meta[i].data.data_len);
 		print_hex(codec->meta[i].data.data,
-			  codec->meta[i].data.data_len -
-			  sizeof(codec->meta[i].data.type));
+			  codec->meta[i].data.data_len - sizeof(codec->meta[i].data.type));
 		printk("\n");
 	}
 }
 
-static bool check_audio_support_and_connect(struct bt_data *data,
-					    void *user_data)
+bool all_headset_connected(void)
+{
+	for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+		if (headset_conn[i] == NULL) {
+			printk("device %d not connected", i);
+			return false;
+		}
+	}
+	printk("all devices connected\n");
+	return true;
+}
+
+static bool check_audio_support_and_connect(struct bt_data *data, void *user_data)
 {
 	bt_addr_le_t *addr = user_data;
 	int i;
-
-	printk("[AD]: %u data_len %u\n", data->type, data->data_len);
-
+	int ret;
+	//printk("[AD]: %u data_len %u\n", data->type, data->data_len);
+	struct bt_conn *conn;
 	switch (data->type) {
-	case BT_DATA_UUID16_SOME:
-	case BT_DATA_UUID16_ALL:
-		if (data->data_len % sizeof(uint16_t) != 0U) {
-			printk("AD malformed\n");
-			return true; /* Continue */
-		}
+	case BT_DATA_NAME_COMPLETE:
+		if ((data->data_len == DEVICE_NAME_PEER_L_LEN) &&
+		    (strncmp(DEVICE_NAME_PEER_L, data->data, DEVICE_NAME_PEER_L_LEN) == 0)) {
+			bt_le_scan_stop();
 
-		for (i = 0; i < data->data_len; i += sizeof(uint16_t)) {
-			struct bt_uuid *uuid;
-			uint16_t uuid_val;
-			int err;
-
-			memcpy(&uuid_val, &data->data[i], sizeof(uuid_val));
-			uuid = BT_UUID_DECLARE_16(sys_le16_to_cpu(uuid_val));
-			if (bt_uuid_cmp(uuid, BT_UUID_ASCS) != 0) {
-				continue;
+			ret = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
+						BT_LE_CONN_PARAM_DEFAULT, &conn);
+			if (ret) {
+				printk("Could not init connection");
+				return ret;
 			}
+			headset_conn[HEADSET_L] = conn;
+			return 0; //stop parsing
+		} else if ((data->data_len == DEVICE_NAME_PEER_R_LEN) &&
+			   (strncmp(DEVICE_NAME_PEER_R, data->data, DEVICE_NAME_PEER_R_LEN) == 0)) {
+			bt_le_scan_stop();
 
-			err = bt_le_scan_stop();
-			if (err != 0) {
-				printk("Failed to stop scan: %d\n", err);
-				return false;
+			ret = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
+						BT_LE_CONN_PARAM_DEFAULT, &conn);
+			if (ret) {
+				printk("Could not init connection");
+				return ret;
 			}
-
-			printk("Audio server found; connecting\n");
-
-			err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-						BT_LE_CONN_PARAM_DEFAULT,
-						&default_conn);
-			if (err != 0) {
-				printk("Create conn to failed (%u)\n", err);
-				start_scan();
-			}
-
-			return false; /* Stop parsing */
+			headset_conn[HEADSET_R] = conn;
+			return 0; //stop parsing
 		}
 	}
-
 	return true;
 }
 
@@ -356,20 +354,13 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 {
 	char addr_str[BT_ADDR_LE_STR_LEN];
 
-	if (default_conn != NULL) {
-		/* Already connected */
+	/* We're only interested in connectable events
+	if (type != BT_GAP_ADV_TYPE_ADV_IND && type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
 		return;
 	}
-
-	/* We're only interested in connectable events */
-	if (type != BT_GAP_ADV_TYPE_ADV_IND &&
-	    type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND &&
-	    type != BT_GAP_ADV_TYPE_EXT_ADV) {
-		return;
-	}
-
+ */
 	(void)bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-	printk("Device found: %s (RSSI %d)\n", addr_str, rssi);
+	//printk("Device found: %s (RSSI %d)\n", addr_str, rssi);
 
 	/* connect only to devices in close proximity */
 	if (rssi < -70) {
@@ -384,7 +375,7 @@ static void start_scan(void)
 	int err;
 
 	/* This demo doesn't require active scan */
-	err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, device_found);
+	err = bt_le_scan_start(BT_LE_SCAN_ACTIVE, device_found);
 	if (err != 0) {
 		printk("Scanning failed to start (err %d)\n", err);
 		return;
@@ -393,8 +384,7 @@ static void start_scan(void)
 	printk("Scanning successfully started\n");
 }
 
-static void stream_configured(struct bt_audio_stream *stream,
-			      const struct bt_codec_qos_pref *pref)
+static void stream_configured(struct bt_audio_stream *stream, const struct bt_codec_qos_pref *pref)
 {
 	printk("Audio Stream %p configured\n", stream);
 
@@ -464,8 +454,7 @@ static void add_remote_sink(struct bt_audio_ep *ep, uint8_t index)
 	sinks[index] = ep;
 }
 
-static void add_remote_codec(struct bt_codec *codec_capabilities, int index,
-				  uint8_t type)
+static void add_remote_codec(struct bt_codec *codec_capabilities, int index, uint8_t type)
 {
 	printk("#%u: codec %p type 0x%02x\n", index, codec_capabilities, type);
 
@@ -480,11 +469,15 @@ static void add_remote_codec(struct bt_codec *codec_capabilities, int index,
 	}
 }
 
-static void discover_sink_cb(struct bt_conn *conn,
-			     struct bt_codec *codec,
-			     struct bt_audio_ep *ep,
+static void discover_sink_cb(struct bt_conn *conn, struct bt_codec *codec, struct bt_audio_ep *ep,
 			     struct bt_audio_discover_params *params)
 {
+	if (conn == headset_conn[HEADSET_L]) {
+		printk("discover sink cb for left\n");
+	} else if (conn == headset_conn[HEADSET_R]) {
+		printk("discover sink cb for right\n");
+	}
+
 	if (params->err != 0) {
 		printk("Discovery failed: %d\n", params->err);
 		return;
@@ -509,7 +502,7 @@ static void discover_sink_cb(struct bt_conn *conn,
 
 	(void)memset(params, 0, sizeof(*params));
 
-	k_sem_give(&sem_sink_discovered);
+	//k_sem_give(&sem_sink_discovered);
 }
 
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -521,26 +514,37 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	if (err != 0) {
 		printk("Failed to connect to %s (%u)\n", addr, err);
 
-		bt_conn_unref(default_conn);
-		default_conn = NULL;
-
+		if (conn == headset_conn[HEADSET_L]) {
+			bt_conn_unref(headset_conn[HEADSET_L]);
+			headset_conn[HEADSET_L] = NULL;
+		} else if (conn == headset_conn[HEADSET_R]) {
+			bt_conn_unref(headset_conn[HEADSET_R]);
+			headset_conn[HEADSET_R] = NULL;
+		}
 		start_scan();
 		return;
 	}
 
-	if (conn != default_conn) {
+	if (conn != headset_conn[HEADSET_L] && conn != headset_conn[HEADSET_R]) {
 		return;
 	}
-
+	err = bt_conn_set_security(conn, BT_SECURITY_L2);
+	if (err != 0) {
+		printk("SMP failed, err = %d", err);
+	}
 	printk("Connected: %s\n", addr);
-	k_sem_give(&sem_connected);
+	if (!all_headset_connected()) {
+		start_scan();
+	} else {
+		bt_le_scan_stop();
+	}
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
-
-	if (conn != default_conn) {
+	printk("%s", __func__);
+	if (conn != headset_conn[HEADSET_L] && conn != headset_conn[HEADSET_R]) {
 		return;
 	}
 
@@ -548,15 +552,84 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	printk("Disconnected: %s (reason 0x%02x)\n", addr, reason);
 
-	bt_conn_unref(default_conn);
-	default_conn = NULL;
+	if (conn == headset_conn[HEADSET_L]) {
+		bt_conn_unref(headset_conn[HEADSET_L]);
+		headset_conn[HEADSET_L] = NULL;
+	} else if (conn == headset_conn[HEADSET_R]) {
+		bt_conn_unref(headset_conn[HEADSET_R]);
+		headset_conn[HEADSET_R] = NULL;
+	}
 
 	start_scan();
 }
+static struct bt_gatt_exchange_params exchange_params;
+static void mtu_exchange_handler(struct bt_conn *conn, uint8_t err,
+				 struct bt_gatt_exchange_params *params)
+{
+	int ret;
+	if (err) {
+		printk("MTU exchange failed, err = %d", err);
+		ret = bt_conn_disconnect(conn, BT_HCI_ERR_LOCALHOST_TERM_CONN);
+		if (ret) {
+			printk("Failed to disconnected, %d", ret);
+		}
+	} else {
+		printk("MTU exchange success");
+		//discover_sink(conn);
+	}
+}
+
+int gateway_mtu_exchange(struct bt_conn *conn)
+{
+	exchange_params.func = mtu_exchange_handler;
+	printk("gateway mtu exchange");
+	return bt_gatt_exchange_mtu(conn, &exchange_params);
+}
+
+static bool conn_param_req_cb(struct bt_conn *conn, struct bt_le_conn_param *param)
+{
+	/* Connection between two nRF5340 Audio DKs are fixed 
+	if ((param->interval_min != CONFIG_BLE_ACL_CONN_INTERVAL) ||
+	    (param->interval_max != CONFIG_BLE_ACL_CONN_INTERVAL)) {
+		return false;
+	}
+	*/
+	return true;
+}
+
+static void conn_param_updated_cb(struct bt_conn *conn, uint16_t interval, uint16_t latency,
+				  uint16_t timeout)
+{
+}
+
+#if (CONFIG_BT_SMP)
+static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
+{
+	int ret;
+
+	if (err) {
+		printk("Security failed: level %u err %d", level, err);
+		ret = bt_conn_disconnect(conn, err);
+		if (ret) {
+			printk("Failed to disconnect %d", ret);
+		}
+	} else {
+		printk("Security changed: level %u\n", level);
+		//ret = gateway_mtu_exchange(conn);
+		//printk("bt_gatt_exchange_mtu() err =%d\n", ret);
+		discover_sink(conn);
+	}
+}
+#endif /* (CONFIG_BT_SMP) */
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
+	.le_param_req = conn_param_req_cb,
+	.le_param_updated = conn_param_updated_cb,
+#if (CONFIG_BT_SMP)
+	.security_changed = security_changed_cb,
+#endif /* (CONFIG_BT_SMP) */
 };
 
 static int init(void)
@@ -585,36 +658,36 @@ static int scan_and_connect(void)
 	int err;
 
 	start_scan();
-
-	err = k_sem_take(&sem_connected, K_FOREVER);
-	if (err != 0) {
-		printk("failed to take sem_connected (err %d)\n", err);
-		return err;
-	}
-
 	return 0;
 }
 
-static int discover_sink(void)
+static int discover_sink(struct bt_conn *conn)
 {
-	static struct bt_audio_discover_params params;
+	static struct bt_audio_discover_params params_l;
+	static struct bt_audio_discover_params params_r;
 	int err;
 
-	params.func = discover_sink_cb;
-	params.type = BT_AUDIO_SINK;
+	params_l.func = discover_sink_cb;
+	params_l.type = BT_AUDIO_SINK;
+	params_r.func = discover_sink_cb;
+	params_r.type = BT_AUDIO_SINK;
 
-	err = bt_audio_discover(default_conn, &params);
+	if (conn == headset_conn[HEADSET_L]) {
+		err = bt_audio_discover(conn, &params_l);
+	} else if (conn == headset_conn[HEADSET_R]) {
+		err = bt_audio_discover(conn, &params_r);	
+	}
 	if (err != 0) {
 		printk("Failed to discover sink: %d\n", err);
 		return err;
 	}
-
+/*
 	err = k_sem_take(&sem_sink_discovered, K_FOREVER);
 	if (err != 0) {
 		printk("failed to take sem_sink_discovered (err %d)\n", err);
 		return err;
 	}
-
+*/
 	return 0;
 }
 
@@ -622,8 +695,7 @@ static int configure_stream(struct bt_audio_stream *stream)
 {
 	int err;
 
-	err = bt_audio_stream_config(default_conn, stream, sinks[0],
-				     &codec_configuration.codec);
+	err = bt_audio_stream_config(default_conn, stream, sinks[0], &codec_configuration.codec);
 	if (err != 0) {
 		printk("Could not configure stream\n");
 		return err;
@@ -642,7 +714,7 @@ static int create_group(struct bt_audio_stream *stream)
 {
 	int err;
 
-	err = bt_audio_unicast_group_create(stream, 1, &unicast_group);
+	err = bt_audio_unicast_group_create(stream, 2, &unicast_group);
 	if (err != 0) {
 		printk("Could not create unicast group (err %d)\n", err);
 		return err;
@@ -655,8 +727,7 @@ static int set_stream_qos(void)
 {
 	int err;
 
-	err = bt_audio_stream_qos(default_conn, unicast_group,
-				&codec_configuration.qos);
+	err = bt_audio_stream_qos(default_conn, unicast_group, &codec_configuration.qos);
 	if (err != 0) {
 		printk("Unable to setup QoS: %d", err);
 		return err;
@@ -726,11 +797,13 @@ void main(void)
 	printk("Initialized\n");
 
 	printk("Waiting for connection\n");
-	err = scan_and_connect();
-	if (err != 0) {
-		return;
+
+	start_scan();
+
+	while (1) {
+		k_sleep(K_MSEC(1000));
 	}
-	printk("Connected\n");
+	/*
 
 	printk("Discovering sink\n");
 	err = discover_sink();
@@ -773,4 +846,5 @@ void main(void)
 		return;
 	}
 	printk("Stream started\n");
+	*/
 }

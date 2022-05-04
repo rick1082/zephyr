@@ -55,7 +55,7 @@ static uint8_t unicast_server_addata[] = {
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_ASCS_VAL)),
-	BT_DATA(BT_DATA_SVC_DATA16, unicast_server_addata, ARRAY_SIZE(unicast_server_addata)),
+	//BT_DATA(BT_DATA_SVC_DATA16, unicast_server_addata, ARRAY_SIZE(unicast_server_addata)),
 };
 
 #if defined(CONFIG_LIBLC3CODEC)
@@ -373,9 +373,27 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	default_conn = NULL;
 }
 
+static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
+{
+	int ret;
+
+	if (err) {
+		printk("Security failed: level %u err %d", level, err);
+		ret = bt_conn_disconnect(conn, err);
+		if (ret) {
+			printk("Failed to disconnect %d", ret);
+		}
+	} else {
+		printk("Security changed: level %u", level);
+	}
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
+#if (CONFIG_BT_SMP)
+	.security_changed = security_changed_cb,
+#endif /* (CONFIG_BT_SMP) */
 };
 
 static struct bt_audio_capability caps[] = {
@@ -389,10 +407,13 @@ static struct bt_audio_capability caps[] = {
 		.ops = &lc3_ops,
 	}
 };
-
+/*
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+};
+*/
 void main(void)
 {
-	struct bt_le_ext_adv *adv;
 	int err;
 
 	err = bt_enable(NULL);
@@ -411,7 +432,9 @@ void main(void)
 		bt_audio_stream_cb_register(&streams[i], &stream_ops);
 	}
 
-	/* Create a non-connectable non-scannable advertising set */
+	/* Create a non-connectable non-scannable advertising set
+	struct bt_le_ext_adv *adv;
+
 	err = bt_le_ext_adv_create(BT_LE_EXT_ADV_CONN_NAME, NULL, &adv);
 	if (err) {
 		printk("Failed to create advertising set (err %d)\n", err);
@@ -427,6 +450,12 @@ void main(void)
 	err = bt_le_ext_adv_start(adv, BT_LE_EXT_ADV_START_DEFAULT);
 	if (err) {
 		printk("Failed to start advertising set (err %d)\n", err);
+		return;
+	}*/
+
+	err = bt_le_adv_start(BT_LE_ADV_CONN_NAME, ad, ARRAY_SIZE(ad), NULL, 0);
+	if (err) {
+		printk("Advertising failed to start (err %d)\n", err);
 		return;
 	}
 
