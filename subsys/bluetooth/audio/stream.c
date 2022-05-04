@@ -411,7 +411,9 @@ static int bt_audio_cig_create(struct bt_audio_unicast_group *group,
 
 	cis_count = 0;
 	SYS_SLIST_FOR_EACH_CONTAINER(&group->streams, stream, node) {
-		group->cis[cis_count++] = stream->iso;
+        if (stream->iso) {
+            group->cis[cis_count++] = stream->iso;
+        }
 	}
 
 	param.num_cis = cis_count;
@@ -520,6 +522,11 @@ int bt_audio_stream_qos(struct bt_conn *conn,
 		struct bt_iso_chan_io_qos *io;
 		struct bt_iso_chan_qos *iso_qos;
 
+		if (stream->conn != conn) {
+			/* Channel not part of this ACL, skip */
+			continue;
+		}
+
 		if (stream->ep == NULL) {
 			BT_DBG("stream->ep is NULL");
 			return -EINVAL;
@@ -538,10 +545,7 @@ int bt_audio_stream_qos(struct bt_conn *conn,
 			return -EINVAL;
 		}
 
-		if (stream->conn != conn) {
-			/* Channel not part of this ACL, skip */
-			continue;
-		}
+
 		conn_stream_found = true;
 
 		if (!bt_audio_valid_stream_qos(stream, qos)) {

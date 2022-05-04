@@ -15,6 +15,7 @@
 #include <bluetooth/audio/audio.h>
 #include <sys/byteorder.h>
 
+
 #define DEVICE_NAME_PEER_L "BT_HEADSET_L"
 #define DEVICE_NAME_PEER_L_LEN (sizeof(DEVICE_NAME_PEER_L) - 1)
 
@@ -31,7 +32,7 @@ enum {
 static struct bt_conn *default_conn;
 static struct bt_conn *headset_conn[2];
 static struct k_work_delayable audio_send_work;
-static struct bt_audio_stream audio_stream;
+static struct bt_audio_stream audio_stream[2];
 static struct bt_audio_unicast_group *unicast_group;
 static struct bt_codec *remote_codec_capabilities[CONFIG_BT_AUDIO_UNICAST_CLIENT_PAC_COUNT];
 static struct bt_audio_ep *sinks[CONFIG_BT_AUDIO_UNICAST_CLIENT_ASE_SNK_COUNT];
@@ -44,8 +45,9 @@ NET_BUF_POOL_FIXED_DEFINE(tx_pool, 1, CONFIG_BT_ISO_TX_MTU + BT_ISO_CHAN_SEND_RE
 static struct bt_audio_lc3_preset codec_configuration = BT_AUDIO_LC3_UNICAST_PRESET_16_2_1;
 
 static int discover_sink(struct bt_conn *conn);
-
-static K_SEM_DEFINE(sem_stream_configured, 0, 1);
+static int configure_stream(struct bt_conn * conn);
+static int create_group(struct bt_audio_stream *stream);
+static int set_stream_qos(struct bt_conn * conn);
 static K_SEM_DEFINE(sem_stream_qos, 0, 1);
 static K_SEM_DEFINE(sem_stream_enabled, 0, 1);
 static K_SEM_DEFINE(sem_stream_started, 0, 1);
@@ -386,16 +388,16 @@ static void start_scan(void)
 
 static void stream_configured(struct bt_audio_stream *stream, const struct bt_codec_qos_pref *pref)
 {
-	printk("Audio Stream %p configured\n", stream);
-
-	k_sem_give(&sem_stream_configured);
+	printk("Audio Stream %p configured, conn %p\n", stream, stream->conn);
+	k_sleep(K_MSEC(500));
+	//k_sem_give(&sem_stream_configured);
+	set_stream_qos(stream->conn);
 }
 
 static void stream_qos_set(struct bt_audio_stream *stream)
 {
 	printk("Audio Stream %p QoS set\n", stream);
-
-	k_sem_give(&sem_stream_qos);
+	//k_sem_give(&sem_stream_qos);
 }
 
 static void stream_enabled(struct bt_audio_stream *stream)
@@ -472,10 +474,13 @@ static void add_remote_codec(struct bt_codec *codec_capabilities, int index, uin
 static void discover_sink_cb(struct bt_conn *conn, struct bt_codec *codec, struct bt_audio_ep *ep,
 			     struct bt_audio_discover_params *params)
 {
+	int ep_index;
 	if (conn == headset_conn[HEADSET_L]) {
 		printk("discover sink cb for left\n");
+		ep_index = HEADSET_L;
 	} else if (conn == headset_conn[HEADSET_R]) {
 		printk("discover sink cb for right\n");
+		ep_index = HEADSET_R;
 	}
 
 	if (params->err != 0) {
@@ -490,7 +495,8 @@ static void discover_sink_cb(struct bt_conn *conn, struct bt_codec *codec, struc
 
 	if (ep != NULL) {
 		if (params->type == BT_AUDIO_SINK) {
-			add_remote_sink(ep, params->num_eps);
+			//add_remote_sink(ep, params->num_eps);
+			add_remote_sink(ep, ep_index);
 		} else {
 			printk("Invalid param type: %u\n", params->type);
 		}
@@ -501,7 +507,7 @@ static void discover_sink_cb(struct bt_conn *conn, struct bt_codec *codec, struc
 	printk("Discover complete: err %d\n", params->err);
 
 	(void)memset(params, 0, sizeof(*params));
-
+	configure_stream(conn);
 	//k_sem_give(&sem_sink_discovered);
 }
 
@@ -642,7 +648,9 @@ static int init(void)
 		return err;
 	}
 
-	audio_stream.ops = &stream_ops;
+	audio_stream[0].ops = &stream_ops;
+	audio_stream[1].ops = &stream_ops;
+	create_group(audio_stream);
 
 #if defined(CONFIG_LIBLC3CODEC)
 	k_work_init_delayable(&audio_send_work, lc3_audio_timer_timeout);
@@ -691,22 +699,26 @@ static int discover_sink(struct bt_conn *conn)
 	return 0;
 }
 
-static int configure_stream(struct bt_audio_stream *stream)
+static int configure_stream(struct bt_conn * conn)
 {
 	int err;
+	int sink_index;
+	//struct bt_audio_stream *stream;
+	if (conn == headset_conn[HEADSET_L]) {
+		sink_index = HEADSET_L;
+		err = bt_audio_stream_config(conn, &audio_stream[HEADSET_L], sinks[sink_index], &codec_configuration.codec);
+	} else if (conn == headset_conn[HEADSET_R]) {
+		sink_index = HEADSET_R;
+		err = bt_audio_stream_config(conn, &audio_stream[HEADSET_R], sinks[sink_index], &codec_configuration.codec);
+	}
 
-	err = bt_audio_stream_config(default_conn, stream, sinks[0], &codec_configuration.codec);
+
 	if (err != 0) {
 		printk("Could not configure stream\n");
 		return err;
 	}
 
-	err = k_sem_take(&sem_stream_configured, K_FOREVER);
-	if (err != 0) {
-		printk("failed to take sem_stream_configured (err %d)\n", err);
-		return err;
-	}
-
+	printk("configure stream for sink[%d] finished\n", sink_index);
 	return 0;
 }
 
@@ -718,27 +730,30 @@ static int create_group(struct bt_audio_stream *stream)
 	if (err != 0) {
 		printk("Could not create unicast group (err %d)\n", err);
 		return err;
+	}else {
+		printk("unicast group created\n");
 	}
-
 	return 0;
 }
 
-static int set_stream_qos(void)
+static int set_stream_qos(struct bt_conn * conn)
 {
 	int err;
 
-	err = bt_audio_stream_qos(default_conn, unicast_group, &codec_configuration.qos);
+	err = bt_audio_stream_qos(conn, unicast_group, &codec_configuration.qos);
 	if (err != 0) {
 		printk("Unable to setup QoS: %d", err);
 		return err;
+	}else {
+		printk("qos set");
 	}
-
+/*
 	err = k_sem_take(&sem_stream_qos, K_FOREVER);
 	if (err != 0) {
 		printk("failed to take sem_stream_qos (err %d)\n", err);
 		return err;
 	}
-
+*/
 	return 0;
 }
 
