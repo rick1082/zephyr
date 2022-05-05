@@ -131,11 +131,11 @@ bool all_headset_connected(void)
 {
 	for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
 		if (headset_conn[i] == NULL) {
-			LOG_ERR("device %d not connected", i);
+			//LOG_ERR("device %d not connected", i);
 			return false;
 		}
 	}
-	LOG_INF("all devices connected\n");
+	LOG_INF("all devices connected");
 	return true;
 }
 
@@ -343,7 +343,7 @@ static void discover_sink_cb(struct bt_conn *conn, struct bt_codec *codec, struc
 			//add_remote_sink(ep, params->num_eps);
 			add_remote_sink(ep, ep_index);
 		} else {
-			printk("Invalid param type: %u", params->type);
+			LOG_INF("Invalid param type: %u", params->type);
 		}
 
 		return;
@@ -450,7 +450,7 @@ static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum 
 			LOG_ERR("Failed to disconnect %d", ret);
 		}
 	} else {
-		LOG_INF("Security changed: level %u\n", level);
+		LOG_INF("Security changed: level %u", level);
 		discover_sink(conn);
 	}
 }
@@ -523,9 +523,9 @@ void main(void)
 	if (err != 0) {
 		return;
 	}
-	printk("Initialized");
+	LOG_INF("Initialized");
 
-	printk("Waiting for connection");
+	LOG_INF("Waiting for connection");
 
 	start_scan();
 
