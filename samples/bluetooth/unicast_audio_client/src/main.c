@@ -25,6 +25,9 @@ LOG_MODULE_REGISTER(main);
 
 static void start_scan(void);
 
+static K_SEM_DEFINE(sem_stream_configured_l, 0, 1);
+static K_SEM_DEFINE(sem_stream_configured_r, 0, 1);
+
 enum {
 	HEADSET_L = 0,
 	HEADSET_R = 1,
@@ -139,9 +142,7 @@ bool all_headset_connected(void)
 	return true;
 }
 
-#define BT_LE_CONN_PARAM_TWS BT_LE_CONN_PARAM(100, \
-						  100, \
-						  0, 400)
+#define BT_LE_CONN_PARAM_TWS BT_LE_CONN_PARAM(100, 100, 0, 400)
 
 static bool check_audio_support_and_connect(struct bt_data *data, void *user_data)
 {
@@ -155,8 +156,8 @@ static bool check_audio_support_and_connect(struct bt_data *data, void *user_dat
 		    (strncmp(DEVICE_NAME_PEER_L, data->data, DEVICE_NAME_PEER_L_LEN) == 0)) {
 			bt_le_scan_stop();
 
-			ret = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-						BT_LE_CONN_PARAM_TWS, &conn);
+			ret = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, BT_LE_CONN_PARAM_TWS,
+						&conn);
 			if (ret) {
 				LOG_ERR("Could not init connection");
 				return ret;
@@ -167,8 +168,8 @@ static bool check_audio_support_and_connect(struct bt_data *data, void *user_dat
 			   (strncmp(DEVICE_NAME_PEER_R, data->data, DEVICE_NAME_PEER_R_LEN) == 0)) {
 			bt_le_scan_stop();
 
-			ret = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-						BT_LE_CONN_PARAM_TWS, &conn);
+			ret = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, BT_LE_CONN_PARAM_TWS,
+						&conn);
 			if (ret) {
 				LOG_ERR("Could not init connection");
 				return ret;
@@ -220,12 +221,20 @@ static void stream_configured(struct bt_audio_stream *stream, const struct bt_co
 {
 	int err;
 	LOG_INF("Audio Stream %p configured, conn %p", (void *)stream, (void *)stream->conn);
+	if(stream->conn == headset_conn[HEADSET_L]) {
+		k_sem_give(&sem_stream_configured_l);
+	}
+	if(stream->conn == headset_conn[HEADSET_R]) {
+		k_sem_give(&sem_stream_configured_r);
+	}
+	/*
 	err = bt_audio_stream_qos(stream->conn, unicast_group, &codec_configuration.qos);
 	if (err != 0) {
 		LOG_ERR("Unable to setup QoS for conn %p: %d", (void *)stream->conn, err);
-	}else {
+	} else {
 		LOG_INF("qos set");
 	}
+	*/
 }
 
 static void stream_qos_set(struct bt_audio_stream *stream)
@@ -354,13 +363,14 @@ static void discover_sink_cb(struct bt_conn *conn, struct bt_codec *codec, struc
 	(void)memset(params, 0, sizeof(*params));
 
 	if (conn == headset_conn[HEADSET_L]) {
-		err = bt_audio_stream_config(conn, &audio_stream[HEADSET_L], sinks[HEADSET_L], &codec_configuration.codec);
+		err = bt_audio_stream_config(conn, &audio_stream[HEADSET_L], sinks[HEADSET_L],
+					     &codec_configuration.codec);
 		LOG_INF("configure stream for sink[HEADSET_L], err = %d", err);
 	} else if (conn == headset_conn[HEADSET_R]) {
-		err = bt_audio_stream_config(conn, &audio_stream[HEADSET_R], sinks[HEADSET_R], &codec_configuration.codec);
+		err = bt_audio_stream_config(conn, &audio_stream[HEADSET_R], sinks[HEADSET_R],
+					     &codec_configuration.codec);
 		LOG_INF("configure stream for sink[HEADSET_R], err = %d", err);
 	}
-
 }
 
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -478,13 +488,14 @@ static int init(void)
 
 	audio_stream[0].ops = &stream_ops;
 	audio_stream[1].ops = &stream_ops;
+	/*
 	err = bt_audio_unicast_group_create(audio_stream, 2, &unicast_group);
 	if (err != 0) {
 		LOG_ERR("bt_audio_unicast_group_create failed, err = %d", err);
 	}else {
 		LOG_INF("bt_audio_unicast_group_create finished");
 	}
-
+	*/
 	k_work_init_delayable(&audio_send_work, audio_timer_timeout);
 
 	return 0;
@@ -504,12 +515,13 @@ static int discover_sink(struct bt_conn *conn)
 	if (conn == headset_conn[HEADSET_L]) {
 		err = bt_audio_discover(conn, &params_l);
 	} else if (conn == headset_conn[HEADSET_R]) {
-		err = bt_audio_discover(conn, &params_r);	
+		err = bt_audio_discover(conn, &params_r);
 	}
 	if (err != 0) {
 		LOG_ERR("Failed to discover sink: %d", err);
 		return err;
 	}
+
 
 	return 0;
 }
@@ -530,6 +542,28 @@ void main(void)
 	start_scan();
 
 	while (1) {
+
+		k_sem_take(&sem_stream_configured_l, K_FOREVER);
+		k_sem_take(&sem_stream_configured_r, K_FOREVER);
+		LOG_INF("READY");
+		err = bt_audio_unicast_group_create(audio_stream, 2, &unicast_group);
+		if (err != 0) {
+			LOG_ERR("bt_audio_unicast_group_create failed, err = %d", err);
+		}else {
+			LOG_INF("bt_audio_unicast_group_create finished");
+		}
+		err = bt_audio_stream_qos(headset_conn[HEADSET_L], unicast_group, &codec_configuration.qos);
+		if (err != 0) {
+			LOG_ERR("Unable to setup QoS for conn %p: %d", (void *)headset_conn[HEADSET_L], err);
+		} else {
+			LOG_INF("qos set");
+		}
+		err = bt_audio_stream_qos(headset_conn[HEADSET_R], unicast_group, &codec_configuration.qos);
+		if (err != 0) {
+			LOG_ERR("Unable to setup QoS for conn %p: %d", (void *)headset_conn[HEADSET_R], err);
+		} else {
+			LOG_INF("qos set");
+		}
 		k_sleep(K_MSEC(1000));
 	}
 }
