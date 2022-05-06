@@ -1381,9 +1381,9 @@ int bt_iso_cig_create(const struct bt_iso_cig_param *param,
 	rsp = hci_le_set_cig_params(cig, param);
 	if (rsp == NULL) {
 		BT_WARN("Unexpected response to hci_le_set_cig_params");
-		err = -EIO;
-		cleanup_cig(cig);
-		return err;
+		//err = -EIO;
+		//cleanup_cig(cig);
+		//return err;
 	}
 
 	cig_rsp = (void *)rsp->data;
@@ -1391,10 +1391,10 @@ int bt_iso_cig_create(const struct bt_iso_cig_param *param,
 	if (rsp->len < sizeof(cig_rsp) ||
 	    cig_rsp->num_handles != param->num_cis) {
 		BT_WARN("Unexpected response to hci_le_set_cig_params");
-		err = -EIO;
+		//err = -EIO;
 		net_buf_unref(rsp);
-		cleanup_cig(cig);
-		return err;
+		//cleanup_cig(cig);
+		//return err;
 	}
 
 	i = 0;
@@ -1617,7 +1617,6 @@ int bt_iso_chan_connect(const struct bt_iso_connect_param *param, size_t count)
 			return -EINVAL;
 		}
 	}
-
 	err = hci_le_create_cis(param, count);
 	if (err) {
 		BT_DBG("Failed to connect CISes: %d", err);

@@ -68,7 +68,7 @@ static void audio_timer_timeout(struct k_work *work)
 	int ret;
 	static uint8_t buf_data[CONFIG_BT_ISO_TX_MTU];
 	static bool data_initialized;
-	struct net_buf *buf;
+	struct net_buf *buf_l, *buf_r;
 	static size_t len_to_send = 1;
 
 	if (!data_initialized) {
@@ -80,18 +80,35 @@ static void audio_timer_timeout(struct k_work *work)
 		data_initialized = true;
 	}
 
-	buf = net_buf_alloc(&tx_pool, K_FOREVER);
-	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
+	if(audio_stream[0].iso->state == BT_ISO_STATE_CONNECTED) {
+			buf_l = net_buf_alloc(&tx_pool, K_FOREVER);
+			net_buf_reserve(buf_l, BT_ISO_CHAN_SEND_RESERVE);
 
-	net_buf_add_mem(buf, buf_data, len_to_send);
-
-	ret = bt_audio_stream_send(&audio_stream, buf);
-	if (ret < 0) {
-		LOG_ERR("Failed to send audio data (%d)", ret);
-		net_buf_unref(buf);
-	} else {
-		LOG_INF("Sending mock data with len %zu", len_to_send);
+			net_buf_add_mem(buf_l, buf_data, len_to_send);
+			ret = bt_audio_stream_send(&audio_stream[0], buf_l);
+			if (ret < 0) {
+				LOG_ERR("Failed to send audio data (%d)", ret);
+				net_buf_unref(buf_l);
+			} else {
+				LOG_INF("Sending mock data with len %zu", len_to_send);
+			}
 	}
+
+
+	if(audio_stream[1].iso->state == BT_ISO_STATE_CONNECTED) {
+			buf_r = net_buf_alloc(&tx_pool, K_FOREVER);
+			net_buf_reserve(buf_r, BT_ISO_CHAN_SEND_RESERVE);
+
+			net_buf_add_mem(buf_r, buf_data, len_to_send);
+			ret = bt_audio_stream_send(&audio_stream[1], buf_r);
+			if (ret < 0) {
+				LOG_ERR("Failed to send audio data (%d)", ret);
+				net_buf_unref(buf_r);
+			} else {
+				LOG_INF("Sending mock data with len %zu", len_to_send);
+			}
+	}
+
 
 	k_work_schedule(&audio_send_work, K_MSEC(1000));
 
@@ -221,6 +238,7 @@ static void stream_configured(struct bt_audio_stream *stream, const struct bt_co
 {
 	int err;
 	LOG_INF("Audio Stream %p configured, conn %p", (void *)stream, (void *)stream->conn);
+
 	if(stream->conn == headset_conn[HEADSET_L]) {
 		k_sem_give(&sem_stream_configured_l);
 	}
@@ -250,23 +268,34 @@ static void stream_qos_set(struct bt_audio_stream *stream)
 		LOG_INF("enable stream");
 	}
 }
-
+K_SEM_DEFINE(sem_stream_start_l, 0, 1);
+K_SEM_DEFINE(sem_stream_start_r, 0, 1);
 static void stream_enabled(struct bt_audio_stream *stream)
 {
 	int err;
 
+
 	LOG_INF("Audio Stream %p enabled", (void *)stream);
+	if(stream->conn == headset_conn[HEADSET_L]) {
+		k_sem_give(&sem_stream_start_l);
+	}
+	if(stream->conn == headset_conn[HEADSET_R]) {
+		k_sem_give(&sem_stream_start_r);
+	}
+/*
 	err = bt_audio_stream_start(stream);
 	if (err != 0) {
 		LOG_ERR("Unable to start stream: %d", err);
 	}
+*/
 }
 
 static void stream_started(struct bt_audio_stream *stream)
 {
 	LOG_INF("Audio Stream %p started", stream);
+	//k_sem_give(&sem_enabled);
 	/* Start send timer */
-	//k_work_schedule(&audio_send_work, K_MSEC(0));
+	k_work_schedule(&audio_send_work, K_MSEC(0));
 }
 
 static void stream_metadata_updated(struct bt_audio_stream *stream)
@@ -389,7 +418,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 			bt_conn_unref(headset_conn[HEADSET_R]);
 			headset_conn[HEADSET_R] = NULL;
 		}
-		k_sleep(K_MSEC(500));
+		
 		start_scan();
 		return;
 	}
@@ -403,7 +432,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	}
 	LOG_INF("Connected: %s", addr);
 	if (!all_headset_connected()) {
-		k_sleep(K_MSEC(500));
+		
 		start_scan();
 	} else {
 		bt_le_scan_stop();
@@ -552,18 +581,31 @@ void main(void)
 		}else {
 			LOG_INF("bt_audio_unicast_group_create finished");
 		}
-		err = bt_audio_stream_qos(headset_conn[HEADSET_L], unicast_group, &codec_configuration.qos);
-		if (err != 0) {
-			LOG_ERR("Unable to setup QoS for conn %p: %d", (void *)headset_conn[HEADSET_L], err);
-		} else {
-			LOG_INF("qos set");
-		}
 		err = bt_audio_stream_qos(headset_conn[HEADSET_R], unicast_group, &codec_configuration.qos);
 		if (err != 0) {
 			LOG_ERR("Unable to setup QoS for conn %p: %d", (void *)headset_conn[HEADSET_R], err);
 		} else {
 			LOG_INF("qos set");
 		}
+
+		err = bt_audio_stream_qos(headset_conn[HEADSET_L], unicast_group, &codec_configuration.qos);
+		if (err != 0) {
+			LOG_ERR("Unable to setup QoS for conn %p: %d", (void *)headset_conn[HEADSET_L], err);
+		} else {
+			LOG_INF("qos set");
+		}
+		k_sem_take(&sem_stream_start_l, K_FOREVER);
+		k_sem_take(&sem_stream_start_r, K_FOREVER);
+		err = bt_audio_stream_start(&audio_stream[0]);
+		if (err != 0) {
+			LOG_ERR("Unable to start stream: %d", err);
+		}
+		k_sleep(K_MSEC(2000));
+		err = bt_audio_stream_start(&audio_stream[1]);
+		if (err != 0) {
+			LOG_ERR("Unable to start stream: %d", err);
+		}
+	
 		k_sleep(K_MSEC(1000));
 	}
 }
